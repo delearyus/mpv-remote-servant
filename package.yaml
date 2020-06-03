@@ -1,0 +1,30 @@
+name:                mpv-remote-servant
+version:             0.1.0.0
+#synopsis:
+#description:
+homepage:            https://github.com/delearyus/mpv-remote-servant#readme
+license:             BSD3
+author:              Jamie Leary
+maintainer:          jmleary@willamette.edu
+copyright:           Jamie Leary 2019
+category:            Web
+extra-source-files:
+- README.md
+
+dependencies:
+  - base >= 4.7 && < 5
+  - unordered-containers
+  - text
+  - aeson
+  - servant-server
+  - wai
+  - wai-app-static
+  - warp
+  - polysemy
+  - bytestring
+  - network
+
+executables:
+  mpv-remote-servant:
+    source-dirs:      src
+    main:             Main.hs
