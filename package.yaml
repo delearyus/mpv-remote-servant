@@ -23,6 +23,7 @@ dependencies:
   - polysemy
   - bytestring
   - network
+  - file-embed
 
 executables:
   mpv-remote-servant:

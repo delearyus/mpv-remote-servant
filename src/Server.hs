@@ -9,48 +9,49 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE PolyKinds #-}
+{-# LANGUAGE RecordWildCards #-}
 
 module Server (entryPoint) where
 
-import Servant
 import Data.Aeson (ToJSON, Value(..), encode, decode)
+import GHC.Generics (Generic)
+
+import System.IO.Error (catchIOError)
+import System.Exit (exitFailure)
+
 import Data.Maybe (fromJust, catMaybes)
 import Data.HashMap.Strict (member)
-import GHC.Generics (Generic)
 import qualified Data.ByteString.Lazy as BS
 import qualified Data.ByteString.Lazy.Char8 as C
+import Data.FileEmbed (embedDir)
+
 import Control.Monad.IO.Class (liftIO)
 import Control.Concurrent (threadDelay)
+
+import Servant
 import Network.Wai (Application)
 import Network.Wai.Handler.Warp (run)
-import WaiAppStatic.Storage.Filesystem
-import WaiAppStatic.Types
+
 import qualified Network.Socket as S
 import qualified Network.Socket.ByteString.Lazy as S
-import Polysemy  (embed, Members, Sem, Member, Embed, interpret, runM, makeSem)
+
+import Polysemy hiding (run)
 import Polysemy.IO
 import Polysemy.Reader
 
 -- CONFIGURATION
--- (replace with a real Reader Config setup later)
 ---------------------------------------------------
 
 data Config = Config
-    { socket :: S.Socket
+    { socketPath :: FilePath
     , port :: Int
     }
 
-defaultConfig :: IO Config
-defaultConfig = do
-    sock <- S.socket S.AF_UNIX S.Stream S.defaultProtocol
-    S.connect sock (S.SockAddrUnix defaultSocketPath)
-    return $ Config { socket = sock, port = defaultPort }
-
-defaultSocketPath :: String
-defaultSocketPath = "/tmp/sock"
-
-defaultPort :: Int
-defaultPort = 8383
+defaultConfig :: Config
+defaultConfig = Config
+    { socketPath = "/tmp/mpvsocket"
+    , port = 8383
+    }
 
 -- DATA TYPES
 ---------------------------------------------------
@@ -59,27 +60,24 @@ data Command = Command { command :: [String] } deriving (Eq,Show,Generic)
 instance ToJSON Command
 
 -- EFFECT TYPES
--- (several layers of polysemy effects to abstract actions)
+-- (several layers of polysemy effects to provide layers of abstraction)
 ---------------------------------------------------
 
 data IPC m a where
     SendMessage :: Command -> IPC m Value
 
 data Socket m a where
-    WriteSocket :: S.Socket -> BS.ByteString -> Socket m ()
-    ReadSocket  :: S.Socket -> Socket m BS.ByteString
+    WriteSocket :: BS.ByteString -> Socket m ()
+    ReadSocket  :: Socket m BS.ByteString
 
 makeSem ''IPC
 makeSem ''Socket
 
-runIPC :: Members '[Reader Config, Socket, Embed IO] r => Sem (IPC ': r) a -> Sem r a
+runIPC :: Members '[Socket] r => Sem (IPC ': r) a -> Sem r a
 runIPC = interpret $ \case
     SendMessage msg -> do
-        config <- ask
-        writeSocket (socket config) $ encode msg
-        embed $ threadDelay (1000*10) -- TODO this is a race condition but 
-                                      -- actually fixing it is tricky
-        res <- readSocket (socket config)
+        writeSocket $ encode msg
+        res <- readSocket
         let responses = decode <$> C.split '\n' res :: [Maybe Value]
         let response = head $ filter isResponse $ catMaybes responses
         return response
@@ -88,16 +86,17 @@ isResponse :: Value -> Bool
 isResponse (Object o) = member "data" o && member "error" o
 isResponse _ = False
 
-runSocket :: Member (Embed IO) r => Sem (Socket ': r) a -> Sem r a
-runSocket = interpret $ \case
-    WriteSocket sock msg -> do
-        embed $ BS.putStr msg
-        embed $ putStrLn ""
-        embed $ S.sendAll sock (msg `BS.append` "\n")
-    ReadSocket sock -> do
-        embed $ putStrLn $ "reading"
-        res <- embed $ S.recv sock 1024
-        return res
+runSocket :: Member (Embed IO) r => S.Socket -> Sem (Socket ': r) a -> Sem r a
+runSocket sock = interpret $ \case
+    WriteSocket msg -> embed $ do
+        BS.putStr msg
+        putStrLn ""
+        S.sendAll sock (msg `BS.append` "\n")
+    ReadSocket -> embed $ do
+        putStrLn $ "reading"
+        threadDelay (1000*10) -- TODO this is a race condition but 
+                              -- actually fixing it is tricky
+        S.recv sock 1024
 
 -- SERVANT API
 ---------------------------------------------------
@@ -115,7 +114,6 @@ apiServer = play_pause :<|> next :<|> prev
           :<|> scrub_back :<|> scrub_forward :<|> subtitles
     where
         sendCommand = sendMessage . Command
-
         play_pause = sendCommand ["cycle","pause"]
         next       = sendCommand ["playlist-next"]
         prev       = sendCommand ["playlist-prev"]
@@ -126,7 +124,7 @@ apiServer = play_pause :<|> next :<|> prev
 type StaticAPI = Raw
 
 staticServer :: ServerT StaticAPI m
-staticServer = serveDirectoryWebApp "static/"
+staticServer = serveDirectoryEmbedded $(embedDir "static/")
 
 type API
     = "api" :> CommandAPI
@@ -136,16 +134,30 @@ server :: Members '[IPC] r => ServerT API (Sem r)
 server = apiServer :<|> staticServer
 
 
+-- Helper Functions
+---------------------------------------
+
+-- natural transformation, tells the server how to run polysemy effects
+nt :: S.Socket -> Sem '[IPC, Socket, Embed IO] a -> Handler a
+nt sock = liftIO . runM . runSocket sock . runIPC
+
+app :: S.Socket -> Application
+app sock = serve api $ hoistServer api (nt sock) server
+    where api = Proxy @API
+
+openSocket :: FilePath -> IO S.Socket
+openSocket path = do
+    sock <- S.socket S.AF_UNIX S.Stream S.defaultProtocol
+    S.connect sock $ S.SockAddrUnix path
+    return sock
+
 -- Entry Point
 ---------------------------------------
 
-nt :: Config -> Sem '[IPC, Socket, Reader Config, Embed IO] a -> Handler a
-nt config = liftIO . runM . runReader config . runSocket . runIPC
-
-app :: Config -> Application
-app config = serve (Proxy @API) $ hoistServer (Proxy @API) (nt config) server
-
 entryPoint :: IO ()
 entryPoint = do
-    config <- defaultConfig
-    run (port config) (app config)
+    let Config{..} = defaultConfig
+    sock <- catchIOError (openSocket socketPath) $ \e -> do
+        putStrLn "Could not connect to IPC socket, please make sure that mpv is running with the --input-ipc-server option"
+        exitFailure
+    run port (app sock)
