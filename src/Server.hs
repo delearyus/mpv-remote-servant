@@ -9,7 +9,7 @@ import Data.FileEmbed (embedDir)
 
 import System.IO.Error (catchIOError)
 import System.Exit (exitFailure)
-
+import Text.Printf
 import Control.Monad.IO.Class (liftIO)
 
 import Servant
@@ -21,6 +21,7 @@ import qualified Network.Socket.ByteString.Lazy as S
 
 import Polysemy hiding (run)
 import Polysemy.IO
+import Polysemy.Trace
 
 import Config
 import Types
@@ -60,12 +61,17 @@ server :: Members '[IPC] r => ServerT API (Sem r)
 server = apiServer :<|> staticServer
 
 -- natural transformation, tells the server how to run polysemy effects
-nt :: S.Socket -> Sem '[IPC, Socket, Embed IO] a -> Handler a
-nt sock = liftIO . runM . runSocket sock . runIPC
+nt :: Config -> S.Socket -> Sem '[IPC, Socket, Trace, Embed IO] a -> Handler a
+nt config sock
+    = liftIO
+    . runM
+    . (if (verbose config) then traceToIO else ignoreTrace)
+    . runSocket config sock
+    . runIPC
 
 -- create a Warp Application from our API server
-app :: S.Socket -> Application
-app sock = serve api $ hoistServer api (nt sock) server
+app :: Config -> S.Socket -> Application
+app config sock = serve api $ hoistServer api (nt config sock) server
     where api = Proxy @API
 
 openSocket :: FilePath -> IO S.Socket
@@ -79,8 +85,9 @@ openSocket path = do
 
 entryPoint :: IO ()
 entryPoint = do
-    let Config{..} = defaultConfig
-    sock <- catchIOError (openSocket socketPath) $ \e -> do
+    let config = defaultConfig
+    sock <- catchIOError (openSocket (socketPath config)) $ \e -> do
         putStrLn "Could not connect to IPC socket, please make sure that mpv is running with the --input-ipc-server option"
         exitFailure
-    run port (app sock)
+    putStrLn $ printf "Listening on port %d." (port config)
+    run (port config) (app config sock)
